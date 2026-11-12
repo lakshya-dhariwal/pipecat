@@ -414,6 +414,7 @@ class XAITTSService(WebsocketTTSService):
         self._base_url = base_url
         self._codec = codec
         self._receive_task = None
+        self._pending_clears = 0
 
         self._timestamp_context_id: str | None = None
         self._partial_word: str = ""
@@ -502,6 +503,8 @@ class XAITTSService(WebsocketTTSService):
             url = self._build_url()
             headers = {"Authorization": f"Bearer {self._api_key}"}
             self._websocket = await self._websocket_connect(url, additional_headers=headers)
+            # A new socket has no outstanding text.clear acknowledgements.
+            self._pending_clears = 0
 
             await self._call_event_handler("on_connected")
         except Exception as e:
@@ -537,6 +540,9 @@ class XAITTSService(WebsocketTTSService):
         """Cancel the current xAI utterance on barge-in without reconnecting."""
         await self.stop_all_metrics()
         if self._websocket and self._websocket.state is State.OPEN:
+            # Increment before sending so a fast ``audio.clear`` acknowledgement
+            # can't be read before the counter is bumped.
+            self._pending_clears += 1
             await self._get_websocket().send(json.dumps({"type": "text.clear"}))
         self._reset_timestamp_state()
         await super().on_audio_context_interrupted(context_id)
@@ -586,6 +592,10 @@ class XAITTSService(WebsocketTTSService):
             context_id = self.get_active_audio_context_id()
 
             if msg_type == "audio.delta":
+                if self._pending_clears > 0:
+                    # Tail of a cleared utterance; drop until the matching
+                    # ``audio.clear`` acknowledgement arrives.
+                    continue
                 audio_b64 = msg.get("delta")
                 if audio_b64:
                     await self.stop_ttfb_metrics()
@@ -601,6 +611,8 @@ class XAITTSService(WebsocketTTSService):
                     # Timestamps arrive in their own (sometimes audio-less) deltas.
                     await self._handle_word_timestamps(msg, context_id)
             elif msg_type == "audio.done":
+                if self._pending_clears > 0:
+                    continue
                 await self.stop_all_metrics()
                 if context_id:
                     # Flush a trailing word that had no terminating space.
@@ -618,6 +630,8 @@ class XAITTSService(WebsocketTTSService):
                     await self._close_audio_context(context_id)
                 await self.push_error(error_msg=f"xAI TTS error: {error_detail}")
             elif msg_type == "audio.clear":
+                if self._pending_clears > 0:
+                    self._pending_clears -= 1
                 logger.trace(f"{self}: xAI acknowledged audio clear")
             else:
                 logger.debug(f"{self}: unhandled xAI message type: {msg_type}")
