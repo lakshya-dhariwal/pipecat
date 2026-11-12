@@ -461,6 +461,106 @@ async def test_xai_websocket_word_timestamps_from_audioless_delta():
     assert "there" in joined
 
 
+class _FakeWS:
+    """Minimal websocket double: send spy plus a fixed inbound message stream."""
+
+    def __init__(self, messages):
+        self.state = State.OPEN
+        self.send = AsyncMock()
+        self._messages = messages
+
+    def __aiter__(self):
+        async def gen():
+            for m in self._messages:
+                yield m
+
+        return gen()
+
+
+@pytest.mark.asyncio
+async def test_xai_websocket_drops_cleared_utterance_tail():
+    """After text.clear, the cleared utterance's tail must not play as the next reply.
+
+    Server stream: rest of cleared utterance A (delta+done), the delayed audio.clear
+    ack, then next reply B (delta+done). Only B's frames may reach the pipeline.
+    """
+    audio_a = b"\xaa" * 8
+    audio_b = b"\xbb" * 8
+    messages = [
+        json.dumps({"type": "audio.delta", "delta": base64.b64encode(audio_a).decode("ascii")}),
+        json.dumps({"type": "audio.done"}),
+        json.dumps({"type": "audio.clear"}),
+        json.dumps({"type": "audio.delta", "delta": base64.b64encode(audio_b).decode("ascii")}),
+        json.dumps({"type": "audio.done"}),
+    ]
+    tts_service = XAITTSService(api_key="test-key", sample_rate=24000)
+    tts_service._websocket = _FakeWS(messages)
+    tts_service._pending_clears = 1
+
+    appended = []
+    closed = []
+
+    async def fake_append(context_id, frame):
+        appended.append((context_id, frame))
+
+    async def fake_remove(context_id):
+        closed.append(context_id)
+
+    with (
+        patch.object(tts_service, "append_to_audio_context", new=fake_append),
+        patch.object(tts_service, "remove_audio_context", new=fake_remove),
+        patch.object(tts_service, "stop_all_metrics", new=AsyncMock()),
+        patch.object(tts_service, "stop_ttfb_metrics", new=AsyncMock()),
+        patch.object(
+            tts_service,
+            "get_active_audio_context_id",
+            side_effect=["ctx-a", "ctx-a", "ctx-b", "ctx-b", "ctx-b"],
+        ),
+    ):
+        await tts_service._receive_messages()
+
+    assert tts_service._pending_clears == 0
+    # Nothing from utterance A (ctx-a) may be appended or closed.
+    assert all(context_id == "ctx-b" for context_id, _ in appended)
+    audio = b"".join(frame.audio for _, frame in appended if isinstance(frame, TTSAudioRawFrame))
+    assert audio == audio_b
+    assert closed == ["ctx-b"]
+
+
+@pytest.mark.asyncio
+async def test_xai_websocket_interruption_counts_pending_clear():
+    """Each text.clear increments the pending-clear counter before it is sent."""
+    tts_service = XAITTSService(api_key="test-key", sample_rate=24000)
+    websocket = AsyncMock()
+    websocket.state = State.OPEN
+    tts_service._websocket = websocket
+
+    await tts_service.on_audio_context_interrupted("ctx-1")
+    await tts_service.on_audio_context_interrupted("ctx-2")
+
+    sent = [json.loads(call.args[0]) for call in websocket.send.call_args_list]
+    assert sent == [{"type": "text.clear"}, {"type": "text.clear"}]
+    assert tts_service._pending_clears == 2
+
+
+@pytest.mark.asyncio
+async def test_xai_websocket_pending_clears_reset_on_connect():
+    """A freshly connected socket has no outstanding audio.clear acknowledgements."""
+    tts_service = XAITTSService(api_key="test-key", sample_rate=24000)
+    tts_service._pending_clears = 2
+
+    websocket = AsyncMock()
+    websocket.state = State.OPEN
+    with (
+        patch.object(tts_service, "_websocket_connect", new=AsyncMock(return_value=websocket)),
+        patch.object(tts_service, "_call_event_handler", new=AsyncMock()),
+    ):
+        await tts_service._connect_websocket()
+
+    assert tts_service._pending_clears == 0
+    assert tts_service._websocket is websocket
+
+
 # Small helper imported lazily to avoid circular import in fixture-lite tests.
 def _SleepAfterSpeak(duration: float):
     from pipecat.tests.utils import SleepFrame
